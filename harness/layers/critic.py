@@ -71,6 +71,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 from __future__ import annotations
 
 from harness.middleware import Middleware
+from harness.layers.injection_guard import filtered_content
 
 
 class Critic(Middleware):
@@ -79,6 +80,63 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+        def observed_line(text):
+            return bool(text) and any(text in line for line in ctx.observed_text.splitlines())
+
+        observations = getattr(ctx, "observations", ())
+
+        def observed_doc_ids(text):
+            return [
+                d.doc_id
+                for d in getattr(ctx.corpus, "docs", ())
+                if any(observation == filtered_content(d.body) for observation in observations)
+                and any(text in line for line in filtered_content(d.body).splitlines())
+            ]
+
+        def doc_ids(text):
+            return observed_doc_ids(text) if observed_line(text) else []
+        kept, split = [], False
+        unresolved = ctx.state.get("citation_unresolved", set())
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            unresolved_claim = (text, claim.get("doc_id")) in unresolved
+            current_ids = observed_doc_ids(text)
+            if not unresolved_claim and claim.get("doc_id") in current_ids:
+                kept.append(claim)
+                continue
+            parts = []
+            for joiner in (" và ", " and "):
+                start = 0
+                while True:
+                    at = text.find(joiner, start)
+                    if at < 0:
+                        break
+                    parts.append((text[:at], text[at + len(joiner):]))
+                    start = at + 1
+            for left, right in parts:
+                left_ids, right_ids = doc_ids(left), doc_ids(right)
+                if left and right and left_ids and right_ids and set(left_ids).isdisjoint(right_ids):
+                    kept.extend(({**claim, "text": left, "doc_id": left_ids[0]},
+                                 {**claim, "text": right, "doc_id": right_ids[0]}))
+                    split = True
+                    break
+            else:
+                if unresolved_claim:
+                    continue
+        report["claims"] = kept
+        report["citations"] = sorted({c.get("doc_id") for c in kept
+                                       if isinstance(c.get("doc_id"), str)})
+        if split or not kept:
+            report["abstain"] = True
+        if not kept:
+            report["citations"] = []
+            report["answer"] = "Insufficient evidence to answer reliably."
+        return report
         # TODO (§2): khoảng 10-25 dòng.
         #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
         #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text

@@ -60,6 +60,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 from __future__ import annotations
 
 from harness.middleware import Middleware
+from harness.layers.injection_guard import filtered_content
 
 
 class CitationChecker(Middleware):
@@ -68,6 +69,41 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
+        claims = report.get("claims")
+        if not isinstance(claims, list) or ctx.corpus is None:
+            return report
+        updated = []
+        unresolved = set()
+        observations = getattr(ctx, "observations", ())
+
+        def observed_body(doc):
+            body = filtered_content(doc.body)
+            return body if any(observation == body for observation in observations) else None
+
+        def supports(doc, text):
+            body = observed_body(doc)
+            return body is not None and any(text in line for line in body.splitlines())
+
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue
+            text = claim["text"]
+            current = ctx.corpus.get(claim.get("doc_id"))
+            if current is not None and supports(current, text):
+                updated.append(claim)
+                continue
+            for doc in ctx.corpus.docs:
+                if supports(doc, text):
+                    updated.append({**claim, "doc_id": doc.doc_id})
+                    break
+            else:
+                updated.append(claim)
+                unresolved.add((text, claim.get("doc_id")))
+        report["claims"] = updated
+        ctx.state["citation_unresolved"] = unresolved
+        report["citations"] = sorted({c.get("doc_id") for c in updated
+                                       if isinstance(c.get("doc_id"), str)})
+        return report
         # TODO (§11): khoảng 10-25 dòng.
         #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
         #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).

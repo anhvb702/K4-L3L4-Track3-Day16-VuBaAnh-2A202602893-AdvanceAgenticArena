@@ -48,11 +48,23 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 from __future__ import annotations
 
 from harness.middleware import Middleware
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
 BLOCK_START = "--- LƯU Ý HỆ THỐNG"
 BLOCK_END = "--- HẾT LƯU Ý HỆ THỐNG ---"
 PLACEHOLDER = "[nội dung không đáng tin cậy đã bị loại bỏ]"
+
+
+def filtered_content(content: str) -> str:
+    """Return the exact observation produced after block isolation."""
+    while BLOCK_START in content:
+        start = content.index(BLOCK_START)
+        end = content.find(BLOCK_END, start + len(BLOCK_START))
+        stop = len(content) if end < 0 else end + len(BLOCK_END)
+        content = content[:start] + PLACEHOLDER + content[stop:]
+    return content
 
 
 class InjectionGuard(Middleware):
@@ -61,6 +73,15 @@ class InjectionGuard(Middleware):
     name = "injection_guard"
 
     def wrap_tool_call(self, ctx, call, name, args):
+        result = call(name, args)
+        content = result.content
+        if not isinstance(content, str) or BLOCK_START not in content:
+            return result
+        return ToolResult(
+            ok=result.ok,
+            content=filtered_content(content),
+            error=result.error,
+        )
         result = call(name, args)
         # TODO (§10): khoảng 8-15 dòng.
         #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
@@ -72,6 +93,24 @@ class InjectionGuard(Middleware):
         return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
 
     def after_agent(self, ctx, report):
+        answer = report.get("answer")
+        if isinstance(answer, str):
+            report["answer"] = answer.replace(INJECTION_CANARY, "")
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            safe = [c for c in claims if isinstance(c, dict)
+                    and isinstance(c.get("text"), str)
+                    and INJECTION_CANARY not in c["text"]
+                    and BLOCK_START not in c["text"]
+                    and BLOCK_END not in c["text"]]
+            if len(safe) != len(claims):
+                report["claims"] = safe
+                report["citations"] = sorted({c.get("doc_id") for c in safe
+                                               if isinstance(c.get("doc_id"), str)})
+                if not safe:
+                    report["abstain"] = True
+                    report["answer"] = "Insufficient evidence to answer reliably."
+        return report
         # TODO (§10): 2-4 dòng.
         #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
         #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
